@@ -18,11 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-
 try:
-    from torchmetrics.functional import structural_similarity_index_measure
+    from torchmetrics.functional import structural_similarity_index_measure as ssim
 except: # old versions
-    from torchmetrics.functional import ssim as structural_similarity_index_measure
+    from torchmetrics.functional import ssim
 
 import trimesh
 from rich.console import Console
@@ -31,6 +30,51 @@ from torch_ema import ExponentialMovingAverage
 from packaging import version as pver
 import lpips
 
+from torchvision import transforms
+from PIL import Image
+
+def affinity_matrix(X):
+    X_norm = F.normalize(X, dim=1)
+    A = torch.mm(X_norm, X_norm.t())
+    return A
+
+def overlay_mask(image, mask, alpha=0.7, color=[1, 0, 0]):
+    # image: [H, W, 3]
+    # mask: [H, W]
+    over_image = image.clone()
+    over_image[mask] = torch.tensor(color, device=image.device, dtype=image.dtype)
+    return image * alpha + over_image * (1 - alpha)
+
+def overlay_point(image, points, radius=2, color=[0, 1, 0]):
+    # image: [H, W, 3]
+    # points: [1, 2]
+    mask = torch.zeros_like(image[:, :, 0]).bool()
+    for point in points:
+        mask[point[1]-radius:point[1]+radius, point[0]-radius:point[0]+radius] = True
+    image[mask] = torch.tensor(color, device=image.device, dtype=image.dtype)
+    return image
+
+def scale_img_nhwc(x, size, mag='bilinear', min='bilinear'):
+    assert (x.shape[1] >= size[0] and x.shape[2] >= size[1]) or (x.shape[1] < size[0] and x.shape[2] < size[1]), "Trying to magnify image in one dimension and minify in the other"
+    y = x.permute(0, 3, 1, 2) # NHWC -> NCHW
+    if x.shape[1] > size[0] and x.shape[2] > size[1]: # Minification, previous size was bigger
+        y = torch.nn.functional.interpolate(y, size, mode=min)
+    else: # Magnification
+        if mag == 'bilinear' or mag == 'bicubic':
+            y = torch.nn.functional.interpolate(y, size, mode=mag, align_corners=True)
+        else:
+            y = torch.nn.functional.interpolate(y, size, mode=mag)
+    return y.permute(0, 2, 3, 1).contiguous() # NCHW -> NHWC
+
+def scale_img_hwc(x, size, mag='bilinear', min='bilinear'):
+    return scale_img_nhwc(x[None, ...], size, mag, min)[0]
+
+def scale_img_nhw(x, size, mag='bilinear', min='bilinear'):
+    return scale_img_nhwc(x[..., None], size, mag, min)[..., 0]
+
+def scale_img_hw(x, size, mag='bilinear', min='bilinear'):
+    return scale_img_nhwc(x[None, ..., None], size, mag, min)[0, ..., 0]
+
 def custom_meshgrid(*args):
     # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
     if pver.parse(torch.__version__) < pver.parse('1.10'):
@@ -38,57 +82,9 @@ def custom_meshgrid(*args):
     else:
         return torch.meshgrid(*args, indexing='ij')
 
-def create_dodecahedron_cameras(radius=1, center=np.array([0, 0, 0])):
-
-    vertices = np.array([
-        -0.57735,  -0.57735,  0.57735,
-        0.934172,  0.356822,  0,
-        0.934172,  -0.356822,  0,
-        -0.934172,  0.356822,  0,
-        -0.934172,  -0.356822,  0,
-        0,  0.934172,  0.356822,
-        0,  0.934172,  -0.356822,
-        0.356822,  0,  -0.934172,
-        -0.356822,  0,  -0.934172,
-        0,  -0.934172,  -0.356822,
-        0,  -0.934172,  0.356822,
-        0.356822,  0,  0.934172,
-        -0.356822,  0,  0.934172,
-        0.57735,  0.57735,  -0.57735,
-        0.57735,  0.57735,  0.57735,
-        -0.57735,  0.57735,  -0.57735,
-        -0.57735,  0.57735,  0.57735,
-        0.57735,  -0.57735,  -0.57735,
-        0.57735,  -0.57735,  0.57735,
-        -0.57735,  -0.57735,  -0.57735,
-        ]).reshape((-1,3), order="C")
-
-    length = np.linalg.norm(vertices, axis=1).reshape((-1, 1))
-    vertices = vertices / length * radius + center
-
-    # construct camera poses by lookat
-    def normalize(x):
-        return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
-
-    # forward is simple, notice that it is in fact the inversion of camera direction!
-    forward_vector = normalize(vertices - center)
-    # pick a temp up_vector, usually [0, 1, 0]
-    up_vector = np.array([0, 1, 0], dtype=np.float32)[None].repeat(forward_vector.shape[0], 0)
-    # cross(up, forward) --> right
-    right_vector = normalize(np.cross(up_vector, forward_vector, axis=-1))
-    # rectify up_vector, by cross(forward, right) --> up
-    up_vector = normalize(np.cross(forward_vector, right_vector, axis=-1))
-
-    ### construct c2w
-    poses = np.eye(4, dtype=np.float32)[None].repeat(forward_vector.shape[0], 0)
-    poses[:, :3, :3] = np.stack((right_vector, up_vector, forward_vector), axis=-1)
-    poses[:, :3, 3] = vertices
-
-    return poses
-
 
 @torch.cuda.amp.autocast(enabled=False)
-def get_rays(poses, intrinsics, H, W, N=-1, patch_size=1, coords=None):
+def get_rays(poses, intrinsics, H, W, N=-1, patch_size=1, coords=None, device='cpu'):
     ''' get rays
     Args:
         poses: [N/1, 4, 4], cam2world
@@ -98,8 +94,6 @@ def get_rays(poses, intrinsics, H, W, N=-1, patch_size=1, coords=None):
         rays_o, rays_d: [N, 3]
         i, j: [N]
     '''
-
-    device = poses.device
     
     if isinstance(intrinsics, np.ndarray):
         fx, fy, cx, cy = intrinsics
@@ -294,9 +288,9 @@ class SSIMMeter:
     def update(self, preds, truths):
         preds, truths = self.prepare_inputs(preds, truths) # [B, H, W, 3] --> [B, 3, H, W], range in [0, 1]
 
-        ssim = structural_similarity_index_measure(preds, truths)
+        v = ssim(preds, truths)
 
-        self.V += ssim
+        self.V += v
         self.N += 1
 
     def measure(self):
@@ -307,6 +301,24 @@ class SSIMMeter:
 
     def report(self):
         return f'SSIM = {self.measure():.6f}'
+
+class Cache:
+    def __init__(self, size=100):
+        self.size = size
+        self.data = {}
+        self.key = 0
+    
+    def full(self):
+        return len(self.data) == self.size
+
+    def insert(self, x):
+        self.data[self.key] = x
+        self.key = (self.key + 1) % self.size
+    
+    def get(self, key=None):
+        if key is None:
+            key = random.randint(0, len(self.data) - 1)
+        return self.data[key]
 
 class Trainer(object):
     def __init__(self, 
@@ -333,6 +345,7 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
+                 sam_predictor=None,
                  ):
         
         self.opt = opt
@@ -356,10 +369,12 @@ class Trainer(object):
         self.scheduler_update_every_step = scheduler_update_every_step
         self.device = device if device is not None else torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
         self.console = Console()
-
-        # try out torch 2.0
-        if torch.__version__[0] == '2':
-            model = torch.compile(model)
+        self.sam_predictor = sam_predictor
+        # for GUI
+        self.point_3d = None
+        self.last_masks = None
+        # for cache
+        self.cache = Cache(self.opt.cache_size)
 
         model.to(self.device)
         if self.world_size > 1:
@@ -452,54 +467,97 @@ class Trainer(object):
     ### ------------------------------	
 
     def train_step(self, data):
+        
+        # use cache instead of novel poses
+        use_cache = self.opt.with_sam and \
+                    self.opt.cache_size > 0 and \
+                    self.cache.full() and \
+                    self.global_step % self.opt.cache_interval != 0
+
+        # override data
+        if use_cache:
+            data = self.cache.get()
 
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
         index = data['index'] # [1/N]
         cam_near_far = data['cam_near_far'] if 'cam_near_far' in data else None # [1/N, 2] or None
+        H, W = data['H'], data['W']
 
-        images = data['images'] # [N, 3/4]
-
-        N, C = images.shape
-
+        N = rays_o.shape[0]
         if self.opt.background == 'random':
             bg_color = torch.rand(N, 3, device=self.device) # [N, 3], pixel-wise random.
         else: # white / last_sample
             bg_color = 1
 
-        if C == 4:
-            gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
+        # rgb training
+        if not self.opt.with_sam:
+
+            images = data['images'] # [N, 3/4]
+
+            C = images.shape[-1]
+            if C == 4:
+                gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
+            else:
+                gt_rgb = images
+
+            update_proposal = (not self.opt.with_sam) and (self.global_step <= 3000 or self.global_step % 5 == 0)
+
+            outputs = self.model.render(rays_o, rays_d, staged=False, index=index, bg_color=bg_color, perturb=True, cam_near_far=cam_near_far, update_proposal=update_proposal, return_feats=0)
+            pred_rgb = outputs['image']
+
+            loss = self.criterion(pred_rgb, gt_rgb).mean()
+
+            # extra loss
+            if 'proposal_loss' in outputs and self.opt.lambda_proposal > 0:
+                loss = loss + self.opt.lambda_proposal * outputs['proposal_loss']
+
+            if 'distort_loss' in outputs and self.opt.lambda_distort > 0:
+                loss = loss + self.opt.lambda_distort * outputs['distort_loss']
+
+            if self.opt.lambda_entropy > 0:
+                w = outputs['weights_sum'].clamp(1e-5, 1 - 1e-5)
+                entropy = - w * torch.log2(w) - (1 - w) * torch.log2(1 - w)
+                loss = loss + self.opt.lambda_entropy * (entropy.mean())
+
+            # adaptive num_rays
+            if self.opt.adaptive_num_rays:
+                self.opt.num_rays = int(round((self.opt.num_points / outputs['num_points']) * self.opt.num_rays))
+
+            return pred_rgb, gt_rgb, loss
+        
+        # online distillation of SAM features
         else:
-            gt_rgb = images
-        
-        shading = 'diffuse' if self.global_step < self.opt.diffuse_step else 'full'
-        update_proposal = self.global_step <= 3000 or self.global_step % 5 == 0
-        
-        outputs = self.model.render(rays_o, rays_d, index=index, bg_color=bg_color, perturb=True, cam_near_far=cam_near_far, shading=shading, update_proposal=update_proposal)
 
-        # MSE loss
-        pred_rgb = outputs['image']
-        loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [N, 3] --> [N]
-    
-        loss = loss.mean()
+            with torch.no_grad():
+                if use_cache:
+                    gt_samvit = data['gt_samvit']
+                else:
+                    # render high-res RGB  
+                    outputs = self.model.render(rays_o, rays_d, staged=True, index=index, bg_color=bg_color, perturb=True, cam_near_far=cam_near_far, update_proposal=False, return_feats=0)
+                    pred_rgb = outputs['image'].reshape(H, W, 3)
 
-        # extra loss
-        if 'proposal_loss' in outputs and self.opt.lambda_proposal > 0:
-            loss = loss + self.opt.lambda_proposal * outputs['proposal_loss']
+                    # encode SAM ground truth
+                    image = (pred_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
+                    self.sam_predictor.set_image(image)
+                    gt_samvit = self.sam_predictor.features # [1, 256, 64, 64]
 
-        if 'distort_loss' in outputs and self.opt.lambda_distort > 0:
-            loss = loss + self.opt.lambda_distort * outputs['distort_loss']
+                    # write to cache
+                    if self.opt.cache_size > 0:
+                        data['gt_samvit'] = gt_samvit
+                        self.cache.insert(data)
 
-        if self.opt.lambda_entropy > 0:
-            w = outputs['weights_sum'].clamp(1e-5, 1 - 1e-5)
-            entropy = - w * torch.log2(w) - (1 - w) * torch.log2(1 - w)
-            loss = loss + self.opt.lambda_entropy * (entropy.mean())
+            # always use 64x64 features as SAM default to 1024x1024
+            h, w = data['h'], data['w']
+            rays_o_hw = data['rays_o_lr']
+            rays_d_hw = data['rays_d_lr']
+            outputs = self.model.render(rays_o_hw, rays_d_hw, staged=False, index=index, bg_color=bg_color, perturb=False, cam_near_far=cam_near_far, return_feats=1, H=h, W=w)
+            pred_samvit = outputs['samvit'].reshape(1, h, w, 256).permute(0, 3, 1, 2).contiguous()
+            pred_samvit = F.interpolate(pred_samvit, gt_samvit.shape[2:], mode='bilinear')
+            # loss
+            loss = self.criterion(pred_samvit, gt_samvit).mean()
 
-        # adaptive num_rays
-        if self.opt.adaptive_num_rays:
-            self.opt.num_rays = int(round((self.opt.num_points / outputs['num_points']) * self.opt.num_rays))
-            
-        return pred_rgb, gt_rgb, loss
+            return pred_samvit, gt_samvit, loss
 
     def post_train_step(self):
 
@@ -519,30 +577,63 @@ class Trainer(object):
 
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
-        images = data['images'] # [H, W, 3/4]
         index = data['index'] # [1/N]
-        H, W, C = images.shape
-
         cam_near_far = data['cam_near_far'] if 'cam_near_far' in data else None # [1/N, 2] or None
-
-        # eval with fixed white background color
+        H, W = data['H'], data['W']
         bg_color = 1
-        if C == 4:
-            gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
-        else:
-            gt_rgb = images
-        
-        outputs = self.model.render(rays_o, rays_d, index=index, bg_color=bg_color, perturb=False, cam_near_far=cam_near_far)
+
+        # full resolution RGBD query, do not query feats!        
+        outputs = self.model.render(rays_o, rays_d, staged=True, index=index, bg_color=bg_color, perturb=False, cam_near_far=cam_near_far, return_feats=0)
 
         pred_rgb = outputs['image'].reshape(H, W, 3)
         pred_depth = outputs['depth'].reshape(H, W)
 
-        loss = self.criterion(pred_rgb, gt_rgb).mean()
+        if not self.opt.with_sam:
+            images = data['images'] # [H, W, 3/4]
+            C = images.shape[-1]
+            if C == 4:
+                gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
+            else:
+                gt_rgb = images
 
-        return pred_rgb, pred_depth, gt_rgb, loss
+            loss = self.criterion(pred_rgb, gt_rgb).mean()
 
-    # moved out bg_color and perturb for more flexible control...
-    def test_step(self, data, bg_color=None, perturb=False, shading='full'):  
+            return pred_rgb, pred_depth, gt_rgb, loss
+
+        else:
+
+            # encode SAM ground truth
+            image = (pred_rgb.detach().cpu().numpy() * 255).astype(np.uint8)
+            self.sam_predictor.set_image(image)
+            gt_samvit = self.sam_predictor.features
+
+            # always use 64x64 features as SAM default to 1024x1024
+            h, w = data['h'], data['w']
+            rays_o_hw = data['rays_o_lr']
+            rays_d_hw = data['rays_d_lr']
+            outputs = self.model.render(rays_o_hw, rays_d_hw, staged=False, index=index, bg_color=bg_color, perturb=False, cam_near_far=cam_near_far, return_feats=1, H=h, W=w)
+            pred_samvit = outputs['samvit'].reshape(1, h, w, 256).permute(0, 3, 1, 2).contiguous()
+            pred_samvit = F.interpolate(pred_samvit, gt_samvit.shape[2:], mode='bilinear')
+
+            # report feature loss
+            loss = self.criterion(pred_samvit, gt_samvit).mean()
+
+            # TODO: grid point samples to evaluate IoU...
+            masks, point_coords, low_res_masks = self.sam_predict(H, W, pred_samvit)
+
+            pred_seg = overlay_mask(pred_rgb, masks[0])
+            pred_seg = overlay_point(pred_seg, point_coords)
+
+            # gt_masks, point_coords, low_res_masks = self.sam_predict(H, W, gt_samvit, point_coords, image=(pred_rgb.detach().cpu().numpy() * 255).astype(np.uint8))
+            gt_masks, point_coords, low_res_masks = self.sam_predict(H, W, gt_samvit, point_coords) # use gt feature to debug
+
+            gt_seg = overlay_mask(pred_rgb, gt_masks[0])
+            gt_seg = overlay_point(gt_seg, point_coords)
+
+            return pred_seg, pred_depth, gt_seg, loss
+    
+
+    def test_step(self, data, bg_color=None, perturb=False, point_coords=None):  
 
         rays_o = data['rays_o'] # [N, 3]
         rays_d = data['rays_d'] # [N, 3]
@@ -554,36 +645,149 @@ class Trainer(object):
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o, rays_d, index=index, bg_color=bg_color, perturb=perturb, cam_near_far=cam_near_far, shading=shading)
+        # full resolution RGBD query, do not query feats!
+        outputs = self.model.render(rays_o, rays_d, staged=True, index=index, bg_color=bg_color, perturb=perturb, cam_near_far=cam_near_far, return_feats=False)
 
         pred_rgb = outputs['image'].reshape(H, W, 3)
         pred_depth = outputs['depth'].reshape(H, W)
 
+        if self.opt.with_sam:   
+            h, w = data['h'], data['w']
+            rays_o_hw = data['rays_o_lr']
+            rays_d_hw = data['rays_d_lr']
+            outputs = self.model.render(rays_o_hw, rays_d_hw, staged=False, index=index, bg_color=bg_color, perturb=False, cam_near_far=cam_near_far, return_feats=1, H=h, W=w)
+            pred_samvit = outputs['samvit'].reshape(1, h, w, 256).permute(0, 3, 1, 2).contiguous()
+
+            # remember new point_3d
+            if point_coords is not None:
+                rays_o = rays_o.view(H, W, 3)
+                rays_d = rays_d.view(H, W, 3)
+                point_depth = pred_depth[point_coords[:, 1], point_coords[:, 0]]
+                point_rays_o = rays_o[point_coords[:, 1], point_coords[:, 0]]
+                point_rays_d = rays_d[point_coords[:, 1], point_coords[:, 0]]
+                point_3d = point_rays_o + point_rays_d * point_depth.unsqueeze(-1) # [1, 3]
+                
+                # update current selected points
+                if self.point_3d is None:
+                    self.point_3d = point_3d
+                else:
+                    dist = (self.point_3d - point_3d).norm(dim=-1)
+                    dist_thresh = 0.01
+                    if dist.min() > dist_thresh:
+                        # add if not close to any existed point
+                        # print(f'[INFO] add new point {point_3d}')
+                        self.point_3d = torch.cat([self.point_3d, point_3d], dim=0)
+                    else:
+                        # remove existed point if too close
+                        # print(f'[INFO] remove old point mask {dist <= dist_thresh}')
+                        keep_mask = dist > dist_thresh
+                        if keep_mask.any():
+                            self.point_3d = self.point_3d[keep_mask]
+                        else:
+                            self.point_3d = None
+
+            # get remembered points coords first
+            inputs_point_coords = None
+            if self.point_3d is not None:
+                point_3d = torch.cat([self.point_3d, torch.ones_like(self.point_3d[:, :1])], axis=-1) # [N, 4]
+                w2c = torch.inverse(data['poses'][0]) # [4, 4]
+                point_3d_cam = point_3d @ w2c.T # [N, 4]
+                intrinsics = data['intrinsics'][0] # [4]
+                fx, fy, cx, cy = intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3]
+                inputs_point_coords = torch.stack([
+                    W - (fx * point_3d_cam[:, 0] / point_3d_cam[:, 2] + cx),
+                    fy * point_3d_cam[:, 1] / point_3d_cam[:, 2] + cy,
+                ], dim=-1).long() # [N, 2]
+                # mask out-of-screen coords
+                screen_mask = (inputs_point_coords[:, 0] >= 0) & (inputs_point_coords[:, 0] < W) & (inputs_point_coords[:, 1] >= 0) & (inputs_point_coords[:, 1] < H)
+                if screen_mask.any():
+                    inputs_point_coords = inputs_point_coords[screen_mask]
+                    # depth test to reject those occluded point_coords
+                    point_depth = - point_3d_cam[screen_mask, 2]
+                    observed_depth = pred_depth[inputs_point_coords[:, 1], inputs_point_coords[:, 0]]
+                    unoccluded_mask = (point_depth - observed_depth).abs() <= 0.05
+                    if unoccluded_mask.any():
+                        inputs_point_coords = inputs_point_coords[unoccluded_mask].detach().cpu().numpy()
+                    else:
+                        inputs_point_coords = None
+                else:
+                    inputs_point_coords = None
+            
+            if inputs_point_coords is not None:
+                # masks, outputs_point_coords, low_res_masks = self.sam_predict(H, W, pred_samvit, inputs_point_coords, image=(pred_rgb.detach().cpu().numpy() * 255).astype(np.uint8))
+                masks, outputs_point_coords, low_res_masks = self.sam_predict(H, W, pred_samvit, inputs_point_coords)
+
+                pred_rgb = overlay_mask(pred_rgb, masks[0])
+                pred_rgb = overlay_point(pred_rgb, outputs_point_coords)
+
         return pred_rgb, pred_depth
 
+    
+    def sam_predict(self, H, W, features, point_coords=None, mask_input=None, image=None):
+        # H/W: original image size
+        # features: [1, 256, h, w]
+        # point_coords: [N, 2] np.ndarray, int32
+        # image: np.ndarray [H, W, 3], uint8, debug use, if provided, override with GT feature
 
-    def save_mesh(self, save_path=None, resolution=128, decimate_target=1e5, dataset=None):
+        resize_ratio = 1024 / W if W > H else 1024 / H
+        input_size = (int(H * resize_ratio), int(W * resize_ratio))
 
-        if save_path is None:
-            save_path = os.path.join(self.workspace, 'mesh')
+        if image is not None:
+            self.sam_predictor.set_image(image)
 
-        self.log(f"==> Saving mesh to {save_path}")
+        else:
+            # mimic set_image
+            self.sam_predictor.reset_image()
+            self.sam_predictor.original_size = (H, W)
+            self.sam_predictor.input_size = input_size
 
-        os.makedirs(save_path, exist_ok=True)
+            h, w = features.shape[2:]
+            resize_ratio_feat = 64 / w if w > h else 64 / h
+            features = F.interpolate(features, (int(h * resize_ratio_feat), int(w * resize_ratio_feat)), mode='bilinear', align_corners=False)
+            features = F.pad(features, (0, 64 - features.shape[3], 0, 64 - features.shape[2]), mode='constant', value=0)
+            self.sam_predictor.features = features
+            self.sam_predictor.is_image_set = True
 
-        self.model.export_mesh(save_path, resolution=resolution, decimate_target=decimate_target, dataset=dataset)
+        if point_coords is None:
+            # random single point if not provided
+            border_h = int(input_size[0] * 0.2)
+            border_w = int(input_size[1] * 0.2)
+            point_coords = np.array([[
+                np.random.randint(0 + border_h, input_size[1] - border_h), 
+                np.random.randint(0 + border_w, input_size[0] - border_w)
+            ]])
+        else:
+            # scale to input size
+            point_coords = (point_coords.astype(np.float32) * resize_ratio).astype(np.int32)
 
-        self.log(f"==> Finished saving mesh.")
+        # use last mask as a prior if provided
+        # NOTE: seems not useful, still need the point inputs...
+        if mask_input is not None:
+            mask_input_torch = torch.as_tensor(mask_input, dtype=torch.float, device=self.device)
+            mask_input_torch = mask_input_torch[None, :, :, :]
+        else:
+            mask_input_torch = None
+    
+        point_labels = np.ones_like(point_coords[:, 0]) # [N]
+        coords_torch = torch.as_tensor(point_coords, dtype=torch.float, device=self.device)
+        labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=self.device)
+        coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
+        
+        # decode
+        masks, iou_predictions, low_res_masks = self.sam_predictor.predict_torch(
+            coords_torch, labels_torch,
+            mask_input=mask_input_torch,
+            multimask_output=False,
+        )
+
+        original_point_coords = (point_coords / resize_ratio).astype(np.int32)
+        return masks[0], original_point_coords, low_res_masks[0] # [N, H, W], [N, 2], [N, 256, 256]
 
     ### ------------------------------
 
     def train(self, train_loader, valid_loader, max_epochs):
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer = tensorboardX.SummaryWriter(os.path.join(self.workspace, "run", self.name))
-
-        # mark untrained region (i.e., not covered by any camera from the training dataset)
-        if self.opt.mark_untrained:
-            self.model.mark_untrained_grid(train_loader._data)
 
         start_t = time.time()
         
@@ -634,7 +838,8 @@ class Trainer(object):
 
             for i, data in enumerate(loader):
                 
-                preds, preds_depth = self.test_step(data)
+                with torch.cuda.amp.autocast(enabled=self.opt.fp16):
+                    preds, preds_depth = self.test_step(data)
                 pred = preds.detach().cpu().numpy()
                 pred = (pred * 255).astype(np.uint8)
 
@@ -673,10 +878,6 @@ class Trainer(object):
         
         loader = iter(train_loader)
 
-        # mark untrained grid
-        if self.global_step == 0 and self.opt.mark_untrained:
-            self.model.mark_untrained_grid(train_loader._data)
-
         for _ in range(step):
             
             # mimic an infinite loop dataloader (in case the total dataset is smaller than step)
@@ -686,15 +887,12 @@ class Trainer(object):
                 loader = iter(train_loader)
                 data = next(loader)
 
-            # update grid every 16 steps
-            if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
-                self.model.update_extra_state()            
-            
             self.global_step += 1
 
             self.optimizer.zero_grad()
 
-            preds, truths, loss_net = self.train_step(data)
+            with torch.cuda.amp.autocast(enabled=self.opt.fp16):
+                preds, truths, loss_net = self.train_step(data)
             
             loss = loss_net
          
@@ -730,7 +928,7 @@ class Trainer(object):
 
     
     # [GUI] test on a single image
-    def test_gui(self, pose, intrinsics, mvp, W, H, bg_color=None, spp=1, downscale=1, shading='full'):
+    def test_gui(self, pose, intrinsics, W, H, bg_color=None, spp=1, downscale=1, user_inputs=None):
         
         # render resolution (may need downscale to for better frame rate)
         rH = int(H * downscale)
@@ -738,18 +936,32 @@ class Trainer(object):
         intrinsics = intrinsics * downscale
 
         pose = torch.from_numpy(pose).unsqueeze(0).to(self.device)
+        intrinsics = torch.from_numpy(intrinsics).unsqueeze(0).to(self.device)
 
-        rays = get_rays(pose, intrinsics, rH, rW, -1)
+        rays = get_rays(pose, intrinsics, rH, rW, -1, device=self.device)
+
+        scale = 16 * rH // 1024 if rH > rW else 16 * rW // 1024
+        rays_lr = get_rays(pose, intrinsics / scale, rH // scale, rW // scale, -1, device=self.device)
 
         data = {
-            'mvp': mvp,
+            'poses': pose,
+            'intrinsics': intrinsics,
             'rays_o': rays['rays_o'],
             'rays_d': rays['rays_d'],
+            'rays_o_lr': rays_lr['rays_o'],
+            'rays_d_lr': rays_lr['rays_d'],
             'H': rH,
             'W': rW,
+            'h': rH // scale,
+            'w': rW // scale,
             'index': [0],
         }
         
+        if user_inputs is not None:
+            point_coords = user_inputs['point_coords']
+        else:
+            point_coords = None
+
         self.model.eval()
 
         if self.ema is not None:
@@ -758,14 +970,14 @@ class Trainer(object):
 
         with torch.no_grad():
             # here spp is used as perturb random seed! (but not perturb the first sample)
-            preds, preds_depth = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp, shading=shading)
+            with torch.cuda.amp.autocast(enabled=self.opt.fp16):
+                preds, preds_depth = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp, point_coords=point_coords)
 
         if self.ema is not None:
             self.ema.restore()
 
         # interpolation to the original resolution
         if downscale != 1:
-            # TODO: have to permute twice with torch...
             preds = F.interpolate(preds.unsqueeze(0).permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).squeeze(0).contiguous()
             preds_depth = F.interpolate(preds_depth.unsqueeze(0).unsqueeze(1), size=(H, W), mode='nearest').squeeze(0).squeeze(1)
 
@@ -800,17 +1012,14 @@ class Trainer(object):
         self.local_step = 0
 
         for data in loader:
-            
-            # update grid every 16 steps
-            if self.model.cuda_ray and self.global_step % self.opt.update_extra_interval == 0:
-                self.model.update_extra_state()
-                    
+             
             self.local_step += 1
             self.global_step += 1
 
             self.optimizer.zero_grad()    
 
-            preds, truths, loss_net = self.train_step(data)
+            with torch.cuda.amp.autocast(enabled=self.opt.fp16):
+                preds, truths, loss_net = self.train_step(data)
             
             loss = loss_net
          
@@ -893,7 +1102,8 @@ class Trainer(object):
             for data in loader:    
                 self.local_step += 1
 
-                preds, preds_depth, truths, loss = self.eval_step(data)
+                with torch.cuda.amp.autocast(enabled=self.opt.fp16):
+                    preds, preds_depth, truths, loss = self.eval_step(data)
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
@@ -925,6 +1135,7 @@ class Trainer(object):
 
                     # save image
                     save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
+                    save_path_gt = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_gt.png') 
                     save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
                     save_path_error = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_error_{metric_vals[0]:.2f}.png') # metric_vals[0] should be the PSNR
 
@@ -943,6 +1154,7 @@ class Trainer(object):
                     error = np.abs(truth.astype(np.float32) - pred.astype(np.float32)).mean(-1).astype(np.uint8)
                     
                     cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+                    cv2.imwrite(save_path_gt, cv2.cvtColor(truth, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(save_path_depth, pred_depth)
                     cv2.imwrite(save_path_error, error)
 
@@ -970,7 +1182,7 @@ class Trainer(object):
         if self.ema is not None:
             self.ema.restore()
 
-        self.log(f"++> Evaluate epoch {self.epoch} Finished.")
+        self.log(f"++> Evaluate epoch {self.epoch} Finished, loss = {average_loss:.6f}")
 
     def save_checkpoint(self, name=None, full=False, best=False, remove_old=True):
 
@@ -982,9 +1194,6 @@ class Trainer(object):
             'global_step': self.global_step,
             'stats': self.stats,
         }
-
-        if self.model.cuda_ray:
-            state['mean_density'] = self.model.mean_density
 
         if full:
             state['optimizer'] = self.optimizer.state_dict()
@@ -1065,11 +1274,6 @@ class Trainer(object):
                 self.log("[INFO] loaded EMA.")
             except:
                 self.log("[WARN] failed to loaded EMA.")
-
-        if self.model.cuda_ray:
-            if 'mean_density' in checkpoint_dict:
-                self.model.mean_density = checkpoint_dict['mean_density']
-    
 
         if model_only:
             return

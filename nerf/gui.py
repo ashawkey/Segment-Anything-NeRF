@@ -88,9 +88,13 @@ class NeRFGUI:
         self.need_update = True # camera moved, should reset accumulation
         self.spp = 1 # sample per pixel
         self.mode = 'image' # choose from ['image', 'depth']
-        self.shading = 'full'
 
-        self.dynamic_resolution = True
+        # handle user input
+        self.mouse_loc = np.array([0, 0])
+        self.selected_point = None
+        self.need_update_user_inputs = True # selected new point, should update user_inputs
+
+        self.dynamic_resolution = False
         self.downscale = 1
         self.train_steps = 16
 
@@ -137,19 +141,21 @@ class NeRFGUI:
 
     
     def test_step(self):
-        # TODO: seems we have to move data from GPU --> CPU --> GPU?
 
         if self.need_update or self.spp < self.opt.max_spp:
         
             starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             starter.record()
 
-            # mvp
-            mv = torch.from_numpy(self.cam.view).cuda() # [4, 4]
-            proj = torch.from_numpy(self.cam.perspective).cuda() # [4, 4]
-            mvp = proj @ mv
+            # user inputs
+            if self.need_update_user_inputs:
+                user_inputs = {}
+                user_inputs['point_coords'] = self.selected_point # [1, 2]
+                self.need_update_user_inputs = False
+            else:
+                user_inputs = None
 
-            outputs = self.trainer.test_gui(self.cam.pose, self.cam.intrinsics, mvp, self.W, self.H, self.bg_color, self.spp, self.downscale, self.shading)
+            outputs = self.trainer.test_gui(self.cam.pose, self.cam.intrinsics, self.W, self.H, self.bg_color, self.spp, self.downscale, user_inputs)
 
             ender.record()
             torch.cuda.synchronize()
@@ -195,7 +201,7 @@ class NeRFGUI:
         dpg.set_primary_window("_primary_window", True)
 
         # control window
-        with dpg.window(label="Control", tag="_control_window", width=400, height=300):
+        with dpg.window(label="Control", tag="_control_window", width=300, height=200):
 
             # button theme
             with dpg.theme() as theme_button:
@@ -219,6 +225,19 @@ class NeRFGUI:
             with dpg.group(horizontal=True):
                 dpg.add_text("SPP: ")
                 dpg.add_text("1", tag="_log_spp")
+
+            # clean marked points
+            with dpg.group(horizontal=True):
+                dpg.add_text("Clear Markers: ")
+
+                def callback_clear_marker(sender, app_data):
+                    self.trainer.point_3d = None
+                    self.selected_point = None
+                    self.need_update = True
+                    self.need_update_user_inputs = True
+
+                dpg.add_button(label="clear", tag="_button_clear_markder", callback=callback_clear_marker)
+                dpg.bind_item_theme("_button_clear_markder", theme_button)
 
             # train button
             if not self.opt.test:
@@ -260,17 +279,6 @@ class NeRFGUI:
             # rendering options
             with dpg.collapsing_header(label="Options", default_open=True):
 
-                # # binary
-                # def callback_set_binary(sender, app_data):
-                #     if self.opt.binary:
-                #         self.opt.binary = False
-                #     else:
-                #         self.opt.binary = True
-                #     self.need_update = True
-
-                # dpg.add_checkbox(label="binary", default_value=self.opt.binary, callback=callback_set_binary)
-
-
                 # dynamic rendering resolution
                 with dpg.group(horizontal=True):
 
@@ -292,13 +300,6 @@ class NeRFGUI:
                 
                 dpg.add_combo(('image', 'depth'), label='mode', default_value=self.mode, callback=callback_change_mode)
 
-                # shading combo
-                def callback_change_shading(sender, app_data):
-                    self.shading = app_data
-                    self.need_update = True
-                
-                dpg.add_combo(('full', 'diffuse', 'specular'), label='shading', default_value=self.shading, callback=callback_change_shading)
-
                 # bg_color picker
                 def callback_change_bg(sender, app_data):
                     self.bg_color = torch.tensor(app_data[:3], dtype=torch.float32) # only need RGB in [0, 1]
@@ -313,28 +314,10 @@ class NeRFGUI:
 
                 dpg.add_slider_int(label="FoV (vertical)", min_value=1, max_value=120, format="%d deg", default_value=self.cam.fovy, callback=callback_set_fovy)
 
-                # dt_gamma slider
-                def callback_set_dt_gamma(sender, app_data):
-                    self.opt.dt_gamma = app_data
-                    self.need_update = True
-
-                dpg.add_slider_float(label="dt_gamma", min_value=0, max_value=0.1, format="%.5f", default_value=self.opt.dt_gamma, callback=callback_set_dt_gamma)
-
-                # max_steps slider
-                def callback_set_max_steps(sender, app_data):
-                    self.opt.max_steps = app_data
-                    self.need_update = True
-
-                dpg.add_slider_int(label="max steps", min_value=1, max_value=1024, format="%d", default_value=self.opt.max_steps, callback=callback_set_max_steps)
-
                 # aabb slider
                 def callback_set_aabb(sender, app_data, user_data):
                     # user_data is the dimension for aabb (xmin, ymin, zmin, xmax, ymax, zmax)
                     self.trainer.model.aabb_infer[user_data] = app_data
-
-                    # also change train aabb ? [better not...]
-                    #self.trainer.model.aabb_train[user_data] = app_data
-
                     self.need_update = True
 
                 dpg.add_separator()
@@ -408,22 +391,34 @@ class NeRFGUI:
                 dpg.set_value("_log_pose", str(self.cam.pose))
 
 
+        def callback_set_mouse_loc(sender, app_data):
+
+            # just the pixel coordinate in image
+            self.mouse_loc = np.array(app_data)
+
+        def callback_point_select(sender, app_data):
+
+            # handle dynamic resolution
+            self.selected_point = np.array([[
+                self.mouse_loc[0] * self.downscale,
+                self.mouse_loc[1] * self.downscale
+            ]]).astype(np.int32)
+
+            self.need_update_user_inputs = True
+            self.need_update = True
+
+
         with dpg.handler_registry():
             dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=callback_camera_drag_rotate)
             dpg.add_mouse_wheel_handler(callback=callback_camera_wheel_scale)
-            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Right, callback=callback_camera_drag_pan)
+            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Middle, callback=callback_camera_drag_pan)
+
+            dpg.add_mouse_move_handler(callback=callback_set_mouse_loc)
+            dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Right, callback=callback_point_select)
 
         
-        dpg.create_viewport(title='torch-ngp', width=self.W, height=self.H, resizable=False)
+        dpg.create_viewport(title='SAM-NeRF', width=self.W, height=self.H, resizable=False)
         
-        # TODO: seems dearpygui doesn't support resizing texture...
-        # def callback_resize(sender, app_data):
-        #     self.W = app_data[0]
-        #     self.H = app_data[1]
-        #     # how to reload texture ???
-
-        # dpg.set_viewport_resize_callback(callback_resize)
-
         ### global theme
         with dpg.theme() as theme_no_padding:
             with dpg.theme_component(dpg.mvAll):

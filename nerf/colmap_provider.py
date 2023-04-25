@@ -12,7 +12,7 @@ import trimesh
 import torch
 from torch.utils.data import DataLoader
 
-from .utils import get_rays, create_dodecahedron_cameras
+from .utils import get_rays
 from .colmap_utils import *
 
 def rotmat(a, b):
@@ -144,11 +144,15 @@ class ColmapDataset:
             img_folder = os.path.join(self.root_path, "images")
         img_paths = np.array([os.path.join(img_folder, name) for name in img_names])
 
+        feature_folder = os.path.join(self.root_path, 'sam_features')
+        feature_paths = np.array([os.path.join(feature_folder, name + '.npz') for name in img_names])
+
         # only keep existing images
         exist_mask = np.array([os.path.exists(f) for f in img_paths])
         print(f'[INFO] {exist_mask.sum()} image exists in all {exist_mask.shape[0]} colmap entries.')
         imkeys = imkeys[exist_mask]
         img_paths = img_paths[exist_mask]
+        feature_paths = feature_paths[exist_mask]
 
         # read intrinsics
         intrinsics = []
@@ -334,36 +338,35 @@ class ColmapDataset:
                 self.poses = self.poses[train_ids]
                 self.intrinsics = self.intrinsics[train_ids]
                 img_paths = img_paths[train_ids]
+                feature_paths = feature_paths[train_ids]
                 if self.cam_near_far is not None:
                     self.cam_near_far = self.cam_near_far[train_ids]
             elif self.type == 'val':
                 self.poses = self.poses[val_ids]
                 self.intrinsics = self.intrinsics[val_ids]
                 img_paths = img_paths[val_ids]
+                feature_paths = feature_paths[val_ids]
                 if self.cam_near_far is not None:
                     self.cam_near_far = self.cam_near_far[val_ids]
             # else: trainval use all.
             
             # read images
-            self.images = []
-
-            for f in tqdm.tqdm(img_paths, desc=f'Loading {self.type} data'):
-
-                image = cv2.imread(f, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
-
-                # add support for the alpha channel as a mask.
-                if image.shape[-1] == 3: 
-                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                else:
-                    image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
-
-                if image.shape[0] != self.H or image.shape[1] != self.W:
-                    image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
-
-                self.images.append(image)
-
-            self.images = np.stack(self.images, axis=0)
-       
+            if not self.opt.with_sam:
+                self.images = []
+                for f in tqdm.tqdm(img_paths, desc=f'Loading {self.type} image'):
+                    image = cv2.imread(f, cv2.IMREAD_UNCHANGED) # [H, W, 3] o [H, W, 4]
+                    # add support for the alpha channel as a mask.
+                    if image.shape[-1] == 3: 
+                        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    else:
+                        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+                    if image.shape[0] != self.H or image.shape[1] != self.W:
+                        image = cv2.resize(image, (self.W, self.H), interpolation=cv2.INTER_AREA)
+                    self.images.append(image)
+                self.images = np.stack(self.images, axis=0)
+            else:
+                self.images = None
+    
         # view all poses.
         if self.opt.vis_pose:
             visualize_poses(self.poses, bound=self.opt.bound, points=self.pts3d)
@@ -371,29 +374,8 @@ class ColmapDataset:
         self.poses = torch.from_numpy(self.poses.astype(np.float32)) # [N, 4, 4]
 
         if self.images is not None:
-            self.images = torch.from_numpy(np.stack(self.images, axis=0).astype(np.uint8)) # [N, H, W, C]
-        
-        # perspective projection matrix
-        self.near = self.opt.min_near
-        self.far = 1000 # infinite
-        aspect = self.W / self.H
-
-        projections = []
-        for intrinsic in self.intrinsics:
-            y = self.H / (2.0 * intrinsic[1].item()) # fl_y
-            projections.append(np.array([[1/(y*aspect), 0, 0, 0], 
-                                        [0, -1/y, 0, 0],
-                                        [0, 0, -(self.far+self.near)/(self.far-self.near), -(2*self.far*self.near)/(self.far-self.near)],
-                                        [0, 0, -1, 0]], dtype=np.float32))
-        self.projections = torch.from_numpy(np.stack(projections)) # [N, 4, 4]
-        self.mvps = self.projections @ torch.inverse(self.poses)
-    
-        # tmp: dodecahedron_cameras for mesh visibility test
-        dodecahedron_poses = create_dodecahedron_cameras()
-        # visualize_poses(dodecahedron_poses, bound=self.opt.bound, points=self.pts3d)
-        self.dodecahedron_poses = torch.from_numpy(dodecahedron_poses.astype(np.float32)) # [N, 4, 4]
-        self.dodecahedron_mvps = self.projections[[0]] @ torch.inverse(self.dodecahedron_poses) # assume the same intrinsic
-
+            self.images = torch.from_numpy(self.images.astype(np.uint8)) # [N, H, W, C]
+      
         if self.preload:
             self.intrinsics = self.intrinsics.to(self.device)
             self.poses = self.poses.to(self.device)
@@ -401,51 +383,82 @@ class ColmapDataset:
                 self.images = self.images.to(self.device)
             if self.cam_near_far is not None:
                 self.cam_near_far = self.cam_near_far.to(self.device)
-            self.mvps = self.mvps.to(self.device)
-
 
     def collate(self, index):
+    
+        num_rays = -1 # defaul, eval, test, train SAM use all rays
 
-        results = {'H': self.H, 'W': self.W}
-
-        if self.training:
-            # randomly sample over images too
+        # train RGB with random rays
+        if self.training and not self.opt.with_sam:
             num_rays = self.opt.num_rays
-
             if self.opt.random_image_batch:
-                index = torch.randint(0, len(self.poses), size=(num_rays,), device=self.device)
+                index = torch.randint(0, len(self.poses), size=(num_rays,), device=self.device if self.preload else 'cpu')
 
-        else:
-            num_rays = -1
+        H, W = self.H, self.W
+        poses = self.poses[index] # [1/N, 4, 4]
+        intrinsics = self.intrinsics[index] # [1/N, 4]
 
-        poses = self.poses[index].to(self.device) # [1/N, 4, 4]
-        intrinsics = self.intrinsics[index].to(self.device) # [1/N, 4]
-        rays = get_rays(poses, intrinsics, self.H, self.W, num_rays)
+        if self.opt.with_sam:
+            # augment poses
+            if self.training:    
+                H = W = self.opt.online_resolution
+                fovy = 50 + 20 * random.random()
+                focal = H / (2 * np.tan(0.5 * fovy * np.pi / 180))
+                intrinsics = np.array([focal, focal, H / 2, W / 2], dtype=np.float32)
+                intrinsics = torch.from_numpy(intrinsics).unsqueeze(0).to(self.device)
+                fs = np.random.choice(len(self.poses), 2, replace=False)
+                pose0 = self.poses[fs[0]].detach().cpu().numpy()
+                pose1 = self.poses[fs[1]].detach().cpu().numpy()
+                rots = Rotation.from_matrix(np.stack([pose0[:3, :3], pose1[:3, :3]]))
+                slerp = Slerp([0, 1], rots)    
+                ratio = random.random()
+                pose = np.eye(4, dtype=np.float32)
+                pose[:3, :3] = slerp(ratio).as_matrix()
+                pose[:3, 3] = (1 - ratio) * pose0[:3, 3] + ratio * pose1[:3, 3]
+                poses = torch.from_numpy(pose).unsqueeze(0).to(self.device)
+            # still use fixed pose, but change intrinsics
+            else:
+                H = W = self.opt.online_resolution
+                fovy = 60
+                focal = H / (2 * np.tan(0.5 * fovy * np.pi / 180))
+                intrinsics = np.array([focal, focal, H / 2, W / 2], dtype=np.float32)
+                intrinsics = torch.from_numpy(intrinsics).unsqueeze(0).to(self.device)
+    
+        results = {'H': H, 'W': W}
 
-        mvp = self.mvps[index].to(self.device)
-        results['mvp'] = mvp
+        rays = get_rays(poses, intrinsics, H, W, num_rays, device=self.device if self.preload else 'cpu')
 
         if self.images is not None:
             
-            if self.training:
-                images = self.images[index, rays['j'], rays['i']].float().to(self.device) / 255 # [N, 3/4]
+            if num_rays != -1:
+                images = self.images[index, rays['j'], rays['i']].float() / 255 # [N, 3/4]
             else:
-                images = self.images[index].squeeze(0).float().to(self.device) / 255 # [H, W, 3/4]
+                images = self.images[index].squeeze(0).float() / 255 # [H, W, 3/4]
 
             if self.training:
                 C = self.images.shape[-1]
                 images = images.view(-1, C)
 
-
-            results['images'] = images
+            results['images'] = images.to(self.device)
         
         if self.opt.enable_cam_near_far and self.cam_near_far is not None:
-            cam_near_far = self.cam_near_far[index].to(self.device) # [1/N, 2]
-            results['cam_near_far'] = cam_near_far
+            cam_near_far = self.cam_near_far[index] # [1/N, 2]
+            results['cam_near_far'] = cam_near_far.to(self.device)
         
-        results['rays_o'] = rays['rays_o']
-        results['rays_d'] = rays['rays_d']
-        results['index'] = index
+        results['poses'] = poses.to(self.device)
+        results['intrinsics'] = intrinsics.to(self.device)
+
+        results['rays_o'] = rays['rays_o'].to(self.device)
+        results['rays_d'] = rays['rays_d'].to(self.device)
+        results['index'] = index.to(self.device) if torch.is_tensor(index) else index
+
+        if self.opt.with_sam:
+            scale = 16 * self.opt.online_resolution // 1024 
+            rays_lr = get_rays(poses, intrinsics / scale, H // scale, W // scale, num_rays, device=self.device if self.preload else 'cpu')
+            results['rays_o_lr'] = rays_lr['rays_o'].to(self.device)
+            results['rays_d_lr'] = rays_lr['rays_d'].to(self.device)
+            results['h'] = H // scale
+            results['w'] = W // scale
 
         return results
 

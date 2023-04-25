@@ -6,7 +6,6 @@ numpy
 scipy
 lpips
 pandas
-trimesh
 PyMCubes
 torch-ema
 dearpygui
@@ -16,11 +15,11 @@ tensorboardX
 opencv-python
 imageio
 imageio-ffmpeg
-pymeshlab
 xatlas
 scikit-learn
 torchmetrics
-
-# torch-scatter
+trimesh
 torch_efficient_distloss
-git+https://github.com/NVlabs/nvdiffrast/
+
+# segment-anything
+git+https://github.com/facebookresearch/segment-anything.git

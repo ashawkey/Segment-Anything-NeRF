@@ -4,7 +4,21 @@
 
 **Segment-Anything NeRF** is a novel approach for performing segmentation in a Neural Radiance Fields (NeRF) framework. Our approach renders the semantic feature of a certain view directly, eliminating the need for the forward process of the backbone of the segmentation model. By leveraging the light-weight [SAM](https://github.com/facebookresearch/segment-anything) decoder, we can achieve **interactive 3D-consistent segmentation** at 5 FPS (rendering 512x512 image) on a V100.
 
-https://user-images.githubusercontent.com/25863658/234220375-56c0a70c-6b3e-4a56-af1e-2b4a8ee62513.mp4
+
+
+https://user-images.githubusercontent.com/23420768/235310664-b432b87e-cfa9-4cbe-9224-1ca90c2e380d.mp4
+
+
+
+https://user-images.githubusercontent.com/23420768/235310629-f0d5c1fe-7b07-4c32-9500-bb27880fa50d.mp4
+
+
+
+
+
+
+# News
+[2023/4/29] Add a demo of Open-Vocabulary Segmentation in NeRF based on [X-Decoder](https://github.com/microsoft/X-Decoder).
 
 
 
@@ -92,6 +106,15 @@ Please check the `scripts` directory for more examples on common datasets, and c
         author={Kirillov, Alexander and Mintun, Eric and Ravi, Nikhila and Mao, Hanzi and Rolland, Chloe and Gustafson, Laura and Xiao, Tete and Whitehead, Spencer and Berg, Alexander C. and Lo, Wan-Yen and Doll{\'a}r, Piotr and Girshick, Ross},
         journal={arXiv:2304.02643},
         year={2023}
+    }
+    ```
+* [X-Decoder](https://github.com/microsoft/X-Decoder):
+    ```
+    @article{zou2022generalized,
+      title={Generalized Decoding for Pixel, Image, and Language},
+      author={Zou, Xueyan and Dou, Zi-Yi and Yang, Jianwei and Gan, Zhe and Li, Linjie and Li, Chunyuan and Dai, Xiyang and Behl, Harkirat and Wang, Jianfeng and Yuan, Lu and others},
+      journal={arXiv preprint arXiv:2212.11270},
+      year={2022}
     }
     ```
 

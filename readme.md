@@ -89,10 +89,10 @@ python main.py data/garden/ --workspace trial2_garden --enable_cam_center --down
 # left drag & middle drag & wheel scroll: move camera
 # right click: add/remove point marker
 # NOTE: only square images are supported for now!
-python main.py data/garden/ --workspace trial2_garden --enable_cam_center --downscale 4 --with_sam --init_ckpt trial_garden/checkpoints/ngp.pth --test --gui
+python main.py data/garden/ --workspace trial2_garden --enable_cam_center --downscale 4 --with_sam --test --gui
 
 # test sam (without GUI, random points query)
-python main.py data/garden/ --workspace trial2_garden --enable_cam_center --downscale 4 --with_sam --init_ckpt trial_garden/checkpoints/ngp.pth --test
+python main.py data/garden/ --workspace trial2_garden --enable_cam_center --downscale 4 --with_sam --test
 ```
 
 Please check the `scripts` directory for more examples on common datasets, and check `main.py` for all options.
